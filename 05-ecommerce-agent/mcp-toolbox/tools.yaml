@@ -1,0 +1,340 @@
+# MCP Toolbox for Databases config for the GenAI Sports shop (toolbox v1.x flat format).
+# Every user-specific tool takes `user_email`. The backend BINDS this parameter to the
+# signed-in user (see sports_shop_agent/agent.py), so the LLM never sees or chooses it.
+kind: source
+name: shop-db
+type: postgres
+host: ${DB_HOST}
+port: ${DB_PORT}
+database: ${DB_NAME}
+user: ${DB_USER}
+password: ${DB_PASSWORD}
+---
+kind: tool
+name: search-products-by-description
+type: postgres-sql
+source: shop-db
+description: Search sport products from a free text description of what the user wants.
+  Returns name, brand, category, description and starting price.
+parameters:
+- name: description
+  type: string
+  description: What the user is looking for, e.g. "backpack for a weekend hike".
+statement: |
+  WITH q AS (SELECT replace(plainto_tsquery('english', $1)::text, '&', '|')::tsquery AS query)
+  SELECT p.name, p.brand, p.category, p.description,
+         (SELECT min(price) FROM products_variants v WHERE v.product_id = p.product_id) AS price_from,
+         round(ts_rank(p.search_doc, q.query)::numeric, 4) AS relevance
+  FROM products p, q
+  WHERE p.search_doc @@ q.query
+  ORDER BY relevance DESC
+  LIMIT 5;
+---
+kind: tool
+name: search-products-by-brand
+type: postgres-sql
+source: shop-db
+description: Search products by brand name. Pass only the brand name (e.g. "Stridex").
+parameters:
+- name: brand
+  type: string
+  description: Brand name only.
+statement: |
+  SELECT p.name, p.brand, p.category, p.description, min(v.price) AS price_from
+  FROM products p JOIN products_variants v ON v.product_id = p.product_id
+  WHERE p.brand ILIKE '%' || $1 || '%'
+  GROUP BY p.product_id
+  ORDER BY p.name
+  LIMIT 10;
+---
+kind: tool
+name: search-products-by-size
+type: postgres-sql
+source: shop-db
+description: Find products available in a given size (e.g. "42", "M", "One Size"), optionally
+  in a category (use empty string for any category).
+parameters:
+- name: size
+  type: string
+  description: The size.
+- name: category
+  type: string
+  description: Category like "Running", or empty string for all.
+statement: |
+  SELECT p.name, p.brand, p.category, v.size, v.color, v.price
+  FROM products p JOIN products_variants v ON v.product_id = p.product_id
+  WHERE lower(v.size) = lower($1)
+    AND ($2 = '' OR p.category ILIKE $2)
+  ORDER BY p.brand, p.name;
+---
+kind: tool
+name: get-product-details
+type: postgres-sql
+source: shop-db
+description: Get full details of a product by its exact name (price, brand, category, sizes, colors, description).
+parameters:
+- name: product_name
+  type: string
+  description: Product name.
+statement: |
+  SELECT p.name, p.brand, p.category, p.description,
+         min(v.price) AS price,
+         string_agg(DISTINCT v.size, ', ') AS sizes,
+         string_agg(DISTINCT v.color, ', ') AS colors
+  FROM products p JOIN products_variants v ON v.product_id = p.product_id
+  WHERE lower(p.name) = lower($1)
+  GROUP BY p.product_id;
+---
+kind: tool
+name: check-inventory
+type: postgres-sql
+source: shop-db
+description: Check stock of a product in each store (units per size/color). Use empty string for store_name to see all stores.
+parameters:
+- name: product_name
+  type: string
+  description: Product name.
+- name: store_name
+  type: string
+  description: Store name or empty string.
+statement: |
+  SELECT s.name AS store, v.size, v.color, i.quantity
+  FROM inventory i
+  JOIN products_variants v ON v.variant_id = i.variant_id
+  JOIN products p ON p.product_id = v.product_id
+  JOIN stores s ON s.store_id = i.store_id
+  WHERE lower(p.name) = lower($1) AND ($2 = '' OR lower(s.name) = lower($2))
+  ORDER BY s.name, v.size, v.color;
+---
+kind: tool
+name: add-product-to-shopping-list
+type: postgres-sql
+source: shop-db
+description: Add one unit of a product (exact name, size and color) to the signed-in user's
+  shopping list. Returns nothing if the size/color combination does not exist.
+parameters:
+- name: user_email
+  type: string
+  description: Signed-in user's email (bound by the backend).
+- name: product_name
+  type: string
+  description: Product name.
+- name: size
+  type: string
+  description: Size, e.g. "42" or "One Size".
+- name: color
+  type: string
+  description: Color, e.g. "Black/White".
+statement: |
+  WITH u AS (SELECT user_id FROM users WHERE email = $1),
+  list AS (
+    INSERT INTO shopping_lists (user_id) SELECT user_id FROM u
+    ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id
+    RETURNING list_id
+  ),
+  variant AS (
+    SELECT v.variant_id FROM products_variants v JOIN products p ON p.product_id = v.product_id
+    WHERE lower(p.name) = lower($2) AND lower(v.size) = lower($3) AND lower(v.color) = lower($4)
+    LIMIT 1
+  )
+  INSERT INTO shopping_list_items (list_id, variant_id, quantity)
+  SELECT list.list_id, variant.variant_id, 1 FROM list, variant
+  RETURNING item_id;
+---
+kind: tool
+name: show-shopping-list
+type: postgres-sql
+source: shop-db
+description: Show the signed-in user's shopping list.
+parameters:
+- name: user_email
+  type: string
+  description: Signed-in user's email (bound by the backend).
+statement: |
+  SELECT p.name AS product, p.brand, p.category, v.size, v.color, v.price, sum(i.quantity) AS quantity
+  FROM users u
+  JOIN shopping_lists l ON l.user_id = u.user_id
+  JOIN shopping_list_items i ON i.list_id = l.list_id
+  JOIN products_variants v ON v.variant_id = i.variant_id
+  JOIN products p ON p.product_id = v.product_id
+  WHERE u.email = $1
+  GROUP BY p.name, p.brand, p.category, v.size, v.color, v.price
+  ORDER BY p.name;
+---
+kind: tool
+name: find-stores-near-user
+type: postgres-sql
+source: shop-db
+description: List the 3 stores closest to the signed-in user's address, with distance in km.
+parameters:
+- name: user_email
+  type: string
+  description: Signed-in user's email (bound by the backend).
+statement: |
+  SELECT s.name, s.address, s.city,
+         round((6371 * acos(least(1, cos(radians(u.latitude)) * cos(radians(s.latitude)) *
+               cos(radians(s.longitude) - radians(u.longitude)) +
+               sin(radians(u.latitude)) * sin(radians(s.latitude)))))::numeric, 2) AS distance_km
+  FROM users u CROSS JOIN stores s
+  WHERE u.email = $1
+  ORDER BY distance_km
+  LIMIT 3;
+---
+kind: tool
+name: list-delivery-methods
+type: postgres-sql
+source: shop-db
+description: List delivery methods (name, description, cost, estimated time) for a store.
+parameters:
+- name: store_name
+  type: string
+  description: Store name.
+statement: |
+  SELECT d.name, d.description, d.base_cost, d.estimated_delivery_time
+  FROM delivery_methods d JOIN stores s ON s.store_id = d.store_id
+  WHERE lower(s.name) = lower($1)
+  ORDER BY d.base_cost;
+---
+kind: tool
+name: place-order
+type: postgres-sql
+source: shop-db
+description: Place an order with everything in the signed-in user's shopping list, fulfilled
+  by the given store with the given delivery method. Empties the shopping list. Always
+  confirm items, store and delivery method with the user before calling this.
+parameters:
+- name: user_email
+  type: string
+  description: Signed-in user's email (bound by the backend).
+- name: store_name
+  type: string
+  description: Store that fulfills the order.
+- name: delivery_method_name
+  type: string
+  description: Delivery method name, e.g. "Standard Home Delivery".
+statement: |
+  WITH u AS (SELECT user_id, address || ', ' || city || ' ' || postal_code AS addr FROM users WHERE email = $1),
+  items AS (
+    SELECT i.item_id, i.variant_id, i.quantity, v.price, p.name,
+           'Size: ' || v.size || ', Color: ' || v.color AS details
+    FROM shopping_lists l
+    JOIN shopping_list_items i ON i.list_id = l.list_id
+    JOIN products_variants v ON v.variant_id = i.variant_id
+    JOIN products p ON p.product_id = v.product_id
+    WHERE l.user_id = (SELECT user_id FROM u)
+  ),
+  st AS (SELECT store_id FROM stores WHERE lower(name) = lower($2)),
+  dm AS (SELECT delivery_method_id, base_cost FROM delivery_methods
+         WHERE store_id = (SELECT store_id FROM st) AND lower(name) = lower($3)),
+  new_order AS (
+    INSERT INTO orders (user_id, store_id, delivery_method_id, shipping_address, shipping_cost, total_amount)
+    SELECT u.user_id, st.store_id, dm.delivery_method_id, u.addr, dm.base_cost,
+           dm.base_cost + (SELECT sum(quantity * price) FROM items)
+    FROM u, st, dm
+    WHERE EXISTS (SELECT 1 FROM items)
+    RETURNING order_id, total_amount
+  ),
+  ins AS (
+    INSERT INTO order_items (order_id, variant_id, quantity, price_at_purchase,
+                             product_name_at_purchase, variant_details_at_purchase)
+    SELECT o.order_id, i.variant_id, i.quantity, i.price, i.name, i.details
+    FROM new_order o CROSS JOIN items i
+    RETURNING order_id
+  ),
+  cleared AS (
+    DELETE FROM shopping_list_items WHERE item_id IN (SELECT item_id FROM items)
+      AND EXISTS (SELECT 1 FROM new_order)
+    RETURNING item_id
+  )
+  SELECT o.order_id, o.total_amount,
+         (SELECT count(*) FROM ins) AS line_items,
+         (SELECT count(*) FROM cleared) AS removed_from_list
+  FROM new_order o;
+---
+kind: tool
+name: check-order-status
+type: postgres-sql
+source: shop-db
+description: Show the signed-in user's orders with store, status, delivery method, total and items.
+parameters:
+- name: user_email
+  type: string
+  description: Signed-in user's email (bound by the backend).
+statement: |
+  SELECT o.order_id, s.name AS store, o.order_status, d.name AS delivery_method,
+         o.shipping_cost, o.total_amount, o.shipping_address,
+         string_agg(oi.product_name_at_purchase || ' (' || oi.variant_details_at_purchase || ') x' ||
+                    oi.quantity || ' @ ' || oi.price_at_purchase, '; ') AS items
+  FROM orders o
+  JOIN users u ON u.user_id = o.user_id
+  JOIN stores s ON s.store_id = o.store_id
+  JOIN delivery_methods d ON d.delivery_method_id = o.delivery_method_id
+  JOIN order_items oi ON oi.order_id = o.order_id
+  WHERE u.email = $1
+  GROUP BY o.order_id, s.name, d.name
+  ORDER BY o.order_id DESC;
+---
+kind: tool
+name: update-order-delivery-method
+type: postgres-sql
+source: shop-db
+description: Change the delivery method of one of the signed-in user's PENDING orders and recompute the total.
+parameters:
+- name: user_email
+  type: string
+  description: Signed-in user's email (bound by the backend).
+- name: order_id
+  type: integer
+  description: Order ID.
+- name: delivery_method_name
+  type: string
+  description: New delivery method name.
+statement: |
+  WITH o AS (
+    SELECT o.order_id, o.store_id FROM orders o JOIN users u ON u.user_id = o.user_id
+    WHERE u.email = $1 AND o.order_id = $2 AND o.order_status = 'pending'
+  ),
+  dm AS (SELECT delivery_method_id, base_cost FROM delivery_methods
+         WHERE store_id = (SELECT store_id FROM o) AND lower(name) = lower($3))
+  UPDATE orders SET
+    delivery_method_id = (SELECT delivery_method_id FROM dm),
+    shipping_cost = (SELECT base_cost FROM dm),
+    total_amount = (SELECT sum(subtotal_line_item) FROM order_items WHERE order_id = $2)
+                   + (SELECT base_cost FROM dm)
+  WHERE order_id = (SELECT order_id FROM o) AND EXISTS (SELECT 1 FROM dm)
+  RETURNING order_id, shipping_cost, total_amount;
+---
+kind: tool
+name: cancel-order
+type: postgres-sql
+source: shop-db
+description: Cancel one of the signed-in user's PENDING orders. Confirm with the user first.
+parameters:
+- name: user_email
+  type: string
+  description: Signed-in user's email (bound by the backend).
+- name: order_id
+  type: integer
+  description: Order ID.
+statement: |
+  UPDATE orders SET order_status = 'cancelled'
+  WHERE order_id = $2 AND order_status = 'pending'
+    AND user_id = (SELECT user_id FROM users WHERE email = $1)
+  RETURNING order_id, order_status;
+---
+kind: group
+name: shop_toolset
+tools:
+- search-products-by-description
+- search-products-by-brand
+- search-products-by-size
+- get-product-details
+- check-inventory
+- add-product-to-shopping-list
+- show-shopping-list
+- find-stores-near-user
+- list-delivery-methods
+- place-order
+- check-order-status
+- update-order-delivery-method
+- cancel-order
